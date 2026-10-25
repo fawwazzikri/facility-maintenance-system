@@ -155,25 +155,36 @@ def save_uploaded_photo(photo):
 # 2. DASHBOARD COUNTS
 # =====================================
 
+
 def get_dashboard_counts():
     counts = {}
 
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS count FROM complaints"
-        ).fetchone()
+        # Total complaints exclude Closed cases
+        row = conn.execute("""
+            SELECT COUNT(*) AS count
+            FROM complaints
+            WHERE status IS DISTINCT FROM %s
+        """, ("Closed",)).fetchone()
+
         counts["total"] = row["count"]
 
+        # Count complaints by status
         for status in ALLOWED_STATUSES:
             key = "status_" + status.lower().replace(" ", "_")
-            row = conn.execute(
-                "SELECT COUNT(*) AS count FROM complaints "
-                "WHERE status = %s",
-                (status,)
-            ).fetchone()
+
+            row = conn.execute("""
+                SELECT COUNT(*) AS count
+                FROM complaints
+                WHERE status = %s
+            """, (status,)).fetchone()
+
             counts[key] = row["count"]
 
+        # Count open complaints by priority
         for priority in ALLOWED_PRIORITIES:
+            key = "priority_" + priority.lower()
+
             row = conn.execute("""
                 SELECT COUNT(*) AS count
                 FROM complaints
@@ -181,9 +192,10 @@ def get_dashboard_counts():
                   AND status NOT IN ('Completed', 'Closed')
             """, (priority,)).fetchone()
 
-            counts["priority_" + priority.lower()] = row["count"]
+            counts[key] = row["count"]
 
     return counts
+
 
 
 # =====================================
