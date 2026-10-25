@@ -1,5 +1,8 @@
 
-from flask import Flask, render_template_string, request, redirect, url_for, send_from_directory, abort
+from flask import (
+    Flask, render_template_string, request, redirect,
+    url_for, send_from_directory, abort
+)
 import sqlite3
 import os
 import uuid
@@ -8,23 +11,39 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 
+# =====================================
+# 1. APPLICATION CONFIGURATION
+# =====================================
+
 DATABASE = os.path.join(app.root_path, "maintenance.db")
 UPLOAD_FOLDER = os.path.join(app.root_path, "uploads")
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 ALLOWED_STATUSES = [
-    "Pending", "In Progress", "Waiting Parts", "Completed", "Closed"
+    "Pending",
+    "In Progress",
+    "Waiting Parts",
+    "Completed",
+    "Closed"
 ]
+
 ALLOWED_PRIORITIES = ["Low", "Medium", "High"]
-TECHNICIANS = ["Technician A", "Technician B", "Technician C"]
+
+TECHNICIANS = [
+    "Technician A",
+    "Technician B",
+    "Technician C"
+]
+
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
 
 # =====================================
-# 1. DATABASE
+# 2. DATABASE
 # =====================================
 
 def get_connection():
@@ -35,9 +54,8 @@ def get_connection():
 
 def create_database():
     conn = get_connection()
-    cursor = conn.cursor()
 
-    cursor.execute("""
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS complaints (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             reporter TEXT,
@@ -49,21 +67,26 @@ def create_database():
         )
     """)
 
-    cursor.execute("PRAGMA table_info(complaints)")
-    columns = [row["name"] for row in cursor.fetchall()]
+    columns = [
+        row["name"]
+        for row in conn.execute(
+            "PRAGMA table_info(complaints)"
+        ).fetchall()
+    ]
 
     if "technician" not in columns:
-        cursor.execute(
+        conn.execute(
             "ALTER TABLE complaints ADD COLUMN technician TEXT"
         )
 
     if "priority" not in columns:
-        cursor.execute(
-            "ALTER TABLE complaints ADD COLUMN priority TEXT DEFAULT 'Medium'"
+        conn.execute(
+            "ALTER TABLE complaints "
+            "ADD COLUMN priority TEXT DEFAULT 'Medium'"
         )
 
     if "photo_path" not in columns:
-        cursor.execute(
+        conn.execute(
             "ALTER TABLE complaints ADD COLUMN photo_path TEXT"
         )
 
@@ -74,7 +97,8 @@ def create_database():
 def allowed_file(filename):
     return (
         "." in filename
-        and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+        and filename.rsplit(".", 1)[1].lower()
+        in ALLOWED_EXTENSIONS
     )
 
 
@@ -85,12 +109,16 @@ def save_uploaded_photo(photo):
     safe_name = secure_filename(photo.filename)
 
     if not safe_name or not allowed_file(safe_name):
-        raise ValueError("Use JPG, JPEG, PNG or WEBP images only.")
+        raise ValueError(
+            "Use JPG, JPEG, PNG or WEBP images only."
+        )
 
     data = photo.stream.read(5 * 1024 * 1024 + 1)
 
     if len(data) > 5 * 1024 * 1024:
-        raise ValueError("Image must be 5 MB or smaller.")
+        raise ValueError(
+            "Image must be 5 MB or smaller."
+        )
 
     extension = safe_name.rsplit(".", 1)[1].lower()
     filename = f"{uuid.uuid4().hex}.{extension}"
@@ -103,42 +131,7 @@ def save_uploaded_photo(photo):
 
 
 # =====================================
-# 2. DASHBOARD COUNTS
-# =====================================
-
-def get_dashboard_counts():
-    conn = get_connection()
-    cursor = conn.cursor()
-    counts = {}
-
-    cursor.execute("SELECT COUNT(*) FROM complaints")
-    counts["total"] = cursor.fetchone()[0]
-
-    for status in ALLOWED_STATUSES:
-        key = "status_" + status.lower().replace(" ", "_")
-
-        cursor.execute(
-            "SELECT COUNT(*) FROM complaints WHERE status = ?",
-            (status,)
-        )
-        counts[key] = cursor.fetchone()[0]
-
-    for priority in ALLOWED_PRIORITIES:
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM complaints
-            WHERE COALESCE(priority, 'Medium') = ?
-              AND status NOT IN ('Completed', 'Closed')
-        """, (priority,))
-
-        counts["priority_" + priority.lower()] = cursor.fetchone()[0]
-
-    conn.close()
-    return counts
-
-
-# =====================================
-# 3. WEBSITE STYLE
+# 3. WEBSITE DESIGN
 # =====================================
 
 STYLE = """
@@ -168,8 +161,9 @@ nav {
 nav a {
     color: white;
     text-decoration: none;
-    margin: 0 12px;
+    margin: 6px 12px;
     font-weight: bold;
+    display: inline-block;
 }
 
 main {
@@ -188,7 +182,9 @@ main {
 
 .dashboard {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
+    grid-template-columns: repeat(
+        auto-fit, minmax(185px, 1fr)
+    );
     gap: 16px;
     margin: 20px 0;
 }
@@ -197,12 +193,11 @@ main {
     display: block;
     color: #263244;
     text-decoration: none;
-    transition: transform .15s, box-shadow .15s;
+    transition: transform .15s;
 }
 
 .stat:hover {
     transform: translateY(-3px);
-    box-shadow: 0 5px 14px #00000020;
 }
 
 .stat h3 { font-size: 16px; }
@@ -244,7 +239,10 @@ button, .button {
     text-decoration: none;
 }
 
-button:hover, .button:hover { background: #12558a; }
+button:hover, .button:hover {
+    background: #12558a;
+}
+
 .danger { background: #b42318; }
 .danger:hover { background: #8f1d14; }
 .secondary { background: #52657a; }
@@ -283,11 +281,17 @@ td form { min-width: 130px; }
     object-fit: contain;
 }
 
+.error {
+    background: #fff0f0;
+    color: #b42318;
+    padding: 12px;
+    border-radius: 6px;
+}
+
 @media (max-width: 600px) {
-    nav a {
-        display: inline-block;
-        margin: 6px;
-    }
+    nav a { margin: 6px; }
+    main { padding: 0 10px; }
+    .card { padding: 14px; }
 }
 </style>
 """
@@ -295,9 +299,9 @@ td form { min-width: 130px; }
 NAV = """
 <header>
     <h1>Facility Maintenance System</h1>
-    <p>Digital Facility Damage Reporting &amp; Maintenance Tracking</p>
+    <p>Digital Facility Damage Reporting &amp;
+       Maintenance Tracking</p>
 </header>
-
 <nav>
     <a href="/">Report Damage</a>
     <a href="/dashboard">Dashboard</a>
@@ -341,9 +345,10 @@ def home():
                 conn = get_connection()
 
                 conn.execute("""
-                    INSERT INTO complaints
-                    (reporter, location, damage, description,
-                     date_reported, status, priority, photo_path)
+                    INSERT INTO complaints (
+                        reporter, location, damage, description,
+                        date_reported, status, priority, photo_path
+                    )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     reporter,
@@ -366,7 +371,8 @@ def home():
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
         <title>Report Damage</title>
     """ + STYLE + """
     </head>
@@ -380,9 +386,7 @@ def home():
             </p>
 
             {% if error_message %}
-            <div class="card" style="color:#b42318;">
-                {{ error_message }}
-            </div>
+            <div class="error">{{ error_message }}</div>
             {% endif %}
 
             <form method="POST" enctype="multipart/form-data">
@@ -391,14 +395,16 @@ def home():
 
                 <label>Building / Location</label>
                 <input type="text" name="location"
-                       placeholder="Example: Building A, Level 2" required>
+                       placeholder="Example: Building A, Level 2"
+                       required>
 
                 <label>Type of Damage</label>
                 <input type="text" name="damage"
                        placeholder="Example: Lamp Damage" required>
 
                 <label>Description</label>
-                <textarea name="description" rows="4" required></textarea>
+                <textarea name="description"
+                          rows="4" required></textarea>
 
                 <label>Damage Photo (optional)</label>
                 <input type="file" name="damage_photo"
@@ -407,7 +413,6 @@ def home():
                        onchange="previewDamagePhoto(event)">
 
                 <p class="muted">
-                    Choose an image or take a picture if supported.
                     JPG, JPEG, PNG or WEBP; maximum 5 MB.
                 </p>
 
@@ -464,14 +469,41 @@ def home():
     """
 
     return render_template_string(
-        html,
-        error_message=error_message
+        html, error_message=error_message
     )
 
 
 # =====================================
-# 5. INTERACTIVE DASHBOARD
+# 5. DASHBOARD
 # =====================================
+
+def get_dashboard_counts():
+    conn = get_connection()
+    counts = {}
+
+    counts["total"] = conn.execute(
+        "SELECT COUNT(*) FROM complaints"
+    ).fetchone()[0]
+
+    for status in ALLOWED_STATUSES:
+        key = "status_" + status.lower().replace(" ", "_")
+
+        counts[key] = conn.execute(
+            "SELECT COUNT(*) FROM complaints WHERE status = ?",
+            (status,)
+        ).fetchone()[0]
+
+    for priority in ALLOWED_PRIORITIES:
+        counts["priority_" + priority.lower()] = conn.execute("""
+            SELECT COUNT(*)
+            FROM complaints
+            WHERE COALESCE(priority, 'Medium') = ?
+              AND status NOT IN ('Completed', 'Closed')
+        """, (priority,)).fetchone()[0]
+
+    conn.close()
+    return counts
+
 
 @app.route("/dashboard")
 def dashboard():
@@ -480,32 +512,22 @@ def dashboard():
     cards = [
         ("Total Complaints", counts["total"],
          "/complaints", "All records"),
-
         ("Pending", counts["status_pending"],
          "/complaints?status=Pending", "Awaiting action"),
-
         ("In Progress", counts["status_in_progress"],
          "/complaints?status=In%20Progress", "Work underway"),
-
         ("Waiting Parts", counts["status_waiting_parts"],
          "/complaints?status=Waiting%20Parts", "Parts required"),
-
         ("Completed", counts["status_completed"],
          "/complaints?status=Completed", "Work completed"),
-
         ("Closed", counts["status_closed"],
          "/complaints?status=Closed", "Cases closed"),
-
         ("Open Low Priority", counts["priority_low"],
-         "/complaints?priority=Low&open=1", "Low priority, still open"),
-
+         "/complaints?priority=Low&open=1", "Low priority, open"),
         ("Open Medium Priority", counts["priority_medium"],
-         "/complaints?priority=Medium&open=1",
-         "Medium priority, still open"),
-
+         "/complaints?priority=Medium&open=1", "Medium priority, open"),
         ("Open High Priority", counts["priority_high"],
-         "/complaints?priority=High&open=1",
-         "High priority, still open")
+         "/complaints?priority=High&open=1", "High priority, open")
     ]
 
     html = """
@@ -513,7 +535,8 @@ def dashboard():
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
         <title>Maintenance Dashboard</title>
     """ + STYLE + """
     </head>
@@ -522,7 +545,7 @@ def dashboard():
     <main>
         <h2>Maintenance Dashboard</h2>
         <p class="muted">
-            Click a card to view the related complaint records.
+            Click a card to view related complaint records.
         </p>
 
         <div class="dashboard">
@@ -538,14 +561,12 @@ def dashboard():
         <div class="card">
             <h3>Dashboard Information</h3>
             <p>
-                Status cards show the number of records at each status.
-                Open priority cards exclude Completed and Closed complaints.
+                Open priority counts exclude Completed and Closed
+                complaints.
             </p>
-            <p>
-                Priority remains in the record as historical information
-                when a job is completed.
-            </p>
-            <a class="button" href="/complaints">Manage Complaints</a>
+            <a class="button" href="/complaints">
+                Manage Complaints
+            </a>
         </div>
     </main>
     </body>
@@ -603,7 +624,8 @@ def complaints():
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
         <title>Complaint Records</title>
     """ + STYLE + """
     </head>
@@ -637,7 +659,6 @@ def complaints():
                 <td>{{ row['location'] or '' }}</td>
                 <td>{{ row['damage'] or '' }}</td>
                 <td>{{ row['date_reported'] or '' }}</td>
-
                 <td>
                     {% if row['photo_path'] %}
                     <a href="{{ url_for('uploaded_photo',
@@ -647,9 +668,7 @@ def complaints():
                     <span class="muted">No photo</span>
                     {% endif %}
                 </td>
-
                 <td>{{ row['priority'] or 'Medium' }}</td>
-
                 <td>
                     <form method="POST"
                           action="/assign_technician/{{ row['id'] }}">
@@ -665,7 +684,6 @@ def complaints():
                         <button type="submit">Assign</button>
                     </form>
                 </td>
-
                 <td>
                     <form method="POST"
                           action="/update_status/{{ row['id'] }}">
@@ -680,24 +698,23 @@ def complaints():
                         <button type="submit">Update</button>
                     </form>
                 </td>
-
                 <td>
                     <a class="button secondary"
                        href="/complaint/{{ row['id'] }}">Details</a>
-
                     <form method="POST"
                           action="/delete_complaint/{{ row['id'] }}"
                           onsubmit="return confirm(
-                          'Delete this complaint permanently? This cannot be undone.'
+                          'Delete this complaint permanently?'
                           );">
-                        <button class="danger" type="submit">Delete</button>
+                        <button class="danger" type="submit">
+                            Delete
+                        </button>
                     </form>
                 </td>
             </tr>
             {% endfor %}
         </table>
         </div>
-
         {% else %}
         <div class="card">No complaints match this filter.</div>
         {% endif %}
@@ -738,7 +755,8 @@ def complaint_details(complaint_id):
     <html>
     <head>
         <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
         <title>Complaint Details</title>
     """ + STYLE + """
     </head>
@@ -752,8 +770,12 @@ def complaint_details(complaint_id):
             <p><b>Damage:</b> {{ row['damage'] or '' }}</p>
             <p><b>Description:</b></p>
             <p>{{ row['description'] or '' }}</p>
-            <p><b>Date Reported:</b> {{ row['date_reported'] or '' }}</p>
-            <p><b>Priority:</b> {{ row['priority'] or 'Medium' }}</p>
+            <p><b>Date Reported:</b>
+                {{ row['date_reported'] or '' }}
+            </p>
+            <p><b>Priority:</b>
+                {{ row['priority'] or 'Medium' }}
+            </p>
             <p><b>Technician:</b>
                 {{ row['technician'] or 'Not assigned' }}
             </p>
@@ -773,7 +795,11 @@ def complaint_details(complaint_id):
             <p><b>Damage Photo:</b> No photo uploaded.</p>
             {% endif %}
 
-            <p><a class="button" href="/complaints">Back to complaints</a></p>
+            <p>
+                <a class="button" href="/complaints">
+                    Back to complaints
+                </a>
+            </p>
         </div>
     </main>
     </body>
@@ -802,7 +828,10 @@ def uploaded_photo(filename):
 # 9. ASSIGN TECHNICIAN
 # =====================================
 
-@app.route("/assign_technician/<int:complaint_id>", methods=["POST"])
+@app.route(
+    "/assign_technician/<int:complaint_id>",
+    methods=["POST"]
+)
 def assign_technician(complaint_id):
     technician = request.form.get("technician", "")
 
@@ -830,7 +859,10 @@ def assign_technician(complaint_id):
 # 10. UPDATE STATUS
 # =====================================
 
-@app.route("/update_status/<int:complaint_id>", methods=["POST"])
+@app.route(
+    "/update_status/<int:complaint_id>",
+    methods=["POST"]
+)
 def update_status(complaint_id):
     status = request.form.get("status", "")
 
@@ -858,7 +890,10 @@ def update_status(complaint_id):
 # 11. DELETE COMPLAINT
 # =====================================
 
-@app.route("/delete_complaint/<int:complaint_id>", methods=["POST"])
+@app.route(
+    "/delete_complaint/<int:complaint_id>",
+    methods=["POST"]
+)
 def delete_complaint(complaint_id):
     conn = get_connection()
 
@@ -892,9 +927,11 @@ def delete_complaint(complaint_id):
 
 
 # =====================================
-# 12. START APPLICATION
+# 12. INITIALIZE DATABASE AND START
 # =====================================
 
+# Runs when Gunicorn imports this module on Render.
+create_database()
+
 if __name__ == "__main__":
-    create_database()
     app.run(debug=False, port=5000)
