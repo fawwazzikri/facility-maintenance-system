@@ -1,53 +1,48 @@
-
 from flask import (
     Flask, render_template_string, request, redirect,
-    url_for, send_from_directory, abort, session, flash
+    url_for, send_from_directory, abort, session
 )
-from functools import wraps
-from werkzeug.security import check_password_hash
-from werkzeug.utils import secure_filename
-from datetime import datetime
-import sqlite3
 import os
 import uuid
 import json
-import secrets
+from datetime import datetime
+from functools import wraps
+from werkzeug.utils import secure_filename
+from werkzeug.security import check_password_hash
+import psycopg
+from psycopg.rows import dict_row
 
 app = Flask(__name__)
 
-# =====================================
-# 1. CONFIGURATION AND SECURITY
-# =====================================
-
-secret_key = os.environ.get("SECRET_KEY")
-
-if not secret_key:
+# Environment variables: Render
+SECRET_KEY = os.environ.get("SECRET_KEY")
+if not SECRET_KEY:
     if os.environ.get("RENDER"):
-        raise RuntimeError("SECRET_KEY is missing from Render.")
-    secret_key = secrets.token_hex(32)
+        raise RuntimeError("SECRET_KEY is missing.")
+    SECRET_KEY = os.urandom(32).hex()
 
-app.secret_key = secret_key
+app.secret_key = SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
-app.config["SESSION_COOKIE_SECURE"] = bool(
-    os.environ.get("RENDER")
-)
+app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("RENDER"))
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing.")
 
 try:
     ADMIN_ACCOUNTS = json.loads(
         os.environ.get("ADMIN_ACCOUNTS", "{}")
     )
 except json.JSONDecodeError:
-    raise RuntimeError("ADMIN_ACCOUNTS must contain valid JSON.")
+    raise RuntimeError("ADMIN_ACCOUNTS must be valid JSON.")
 
-if not isinstance(ADMIN_ACCOUNTS, dict):
-    raise RuntimeError("ADMIN_ACCOUNTS must be a JSON object.")
+if not isinstance(ADMIN_ACCOUNTS, dict) or not ADMIN_ACCOUNTS:
+    raise RuntimeError("ADMIN_ACCOUNTS is empty or invalid.")
 
-DATABASE = os.path.join(app.root_path, "maintenance.db")
 UPLOAD_FOLDER = os.path.join(app.root_path, "uploads")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
 ALLOWED_STATUSES = [
@@ -60,16 +55,57 @@ ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
 
 # =====================================
-# 2. ACCESS CONTROL
+# 1. DATABASE - NEON POSTGRESQL
 # =====================================
+
+def get_connection():
+    return psycopg.connect(
+        DATABASE_URL,
+        row_factory=dict_row,
+        sslmode="require"
+    )
+
+
+def create_database():
+    with get_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS complaints (
+                id BIGSERIAL PRIMARY KEY,
+                reporter TEXT,
+                location TEXT,
+                damage TEXT,
+                description TEXT,
+                date_reported TEXT,
+                status TEXT DEFAULT 'Pending',
+                technician TEXT,
+                priority TEXT DEFAULT 'Medium',
+                photo_path TEXT
+            )
+        """)
+
+        conn.execute("""
+            ALTER TABLE complaints
+            ADD COLUMN IF NOT EXISTS technician TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE complaints
+            ADD COLUMN IF NOT EXISTS priority TEXT DEFAULT 'Medium'
+        """)
+        conn.execute("""
+            ALTER TABLE complaints
+            ADD COLUMN IF NOT EXISTS photo_path TEXT
+        """)
+
 
 def admin_required(view_function):
     @wraps(view_function)
-    def wrapped_view(*args, **kwargs):
+    def wrapped(*args, **kwargs):
         if "admin_username" not in session:
-            return redirect(url_for("admin_login", next=request.path))
+            return redirect(
+                url_for("admin_login", next=request.path)
+            )
         return view_function(*args, **kwargs)
-    return wrapped_view
+    return wrapped
 
 
 def valid_internal_path(path):
@@ -79,58 +115,6 @@ def valid_internal_path(path):
         and not path.startswith("//")
         and "\\" not in path
     )
-
-
-# =====================================
-# 3. DATABASE
-# =====================================
-
-def get_connection():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def create_database():
-    conn = get_connection()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS complaints (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reporter TEXT,
-            location TEXT,
-            damage TEXT,
-            description TEXT,
-            date_reported TEXT,
-            status TEXT DEFAULT 'Pending'
-        )
-    """)
-
-    columns = {
-        row["name"]
-        for row in conn.execute(
-            "PRAGMA table_info(complaints)"
-        ).fetchall()
-    }
-
-    if "technician" not in columns:
-        conn.execute(
-            "ALTER TABLE complaints ADD COLUMN technician TEXT"
-        )
-
-    if "priority" not in columns:
-        conn.execute(
-            "ALTER TABLE complaints "
-            "ADD COLUMN priority TEXT DEFAULT 'Medium'"
-        )
-
-    if "photo_path" not in columns:
-        conn.execute(
-            "ALTER TABLE complaints ADD COLUMN photo_path TEXT"
-        )
-
-    conn.commit()
-    conn.close()
 
 
 def allowed_file(filename):
@@ -148,7 +132,9 @@ def save_uploaded_photo(photo):
     safe_name = secure_filename(photo.filename)
 
     if not safe_name or not allowed_file(safe_name):
-        raise ValueError("Use JPG, JPEG, PNG or WEBP images only.")
+        raise ValueError(
+            "Use JPG, JPEG, PNG or WEBP images only."
+        )
 
     data = photo.stream.read(5 * 1024 * 1024 + 1)
 
@@ -166,7 +152,42 @@ def save_uploaded_photo(photo):
 
 
 # =====================================
-# 4. COMMON WEBSITE DESIGN
+# 2. DASHBOARD COUNTS
+# =====================================
+
+def get_dashboard_counts():
+    counts = {}
+
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS count FROM complaints"
+        ).fetchone()
+        counts["total"] = row["count"]
+
+        for status in ALLOWED_STATUSES:
+            key = "status_" + status.lower().replace(" ", "_")
+            row = conn.execute(
+                "SELECT COUNT(*) AS count FROM complaints "
+                "WHERE status = %s",
+                (status,)
+            ).fetchone()
+            counts[key] = row["count"]
+
+        for priority in ALLOWED_PRIORITIES:
+            row = conn.execute("""
+                SELECT COUNT(*) AS count
+                FROM complaints
+                WHERE COALESCE(priority, 'Medium') = %s
+                  AND status NOT IN ('Completed', 'Closed')
+            """, (priority,)).fetchone()
+
+            counts["priority_" + priority.lower()] = row["count"]
+
+    return counts
+
+
+# =====================================
+# 3. WEBSITE STYLE
 # =====================================
 
 STYLE = """
@@ -189,15 +210,14 @@ header {
 
 nav {
     background: #244a73;
-    padding: 12px;
+    padding: 15px;
     text-align: center;
 }
 
 nav a {
     color: white;
     text-decoration: none;
-    margin: 6px 10px;
-    display: inline-block;
+    margin: 0 12px;
     font-weight: bold;
 }
 
@@ -226,9 +246,14 @@ main {
     display: block;
     color: #263244;
     text-decoration: none;
+    transition: transform .15s, box-shadow .15s;
 }
 
-.stat:hover { transform: translateY(-2px); }
+.stat:hover {
+    transform: translateY(-3px);
+    box-shadow: 0 5px 14px #00000020;
+}
+
 .stat h3 { font-size: 16px; }
 
 .number {
@@ -270,6 +295,7 @@ button, .button {
 
 button:hover, .button:hover { background: #12558a; }
 .danger { background: #b42318; }
+.danger:hover { background: #8f1d14; }
 .secondary { background: #52657a; }
 
 .table-wrap { overflow-x: auto; }
@@ -306,77 +332,43 @@ td form { min-width: 130px; }
     object-fit: contain;
 }
 
-.message {
-    padding: 12px;
-    margin-bottom: 12px;
-    border-radius: 6px;
-    background: #e8f2ff;
-}
-
-.error {
-    background: #fff0f0;
-    color: #b42318;
-}
-
-.login-card {
-    max-width: 460px;
-    margin: 35px auto;
-}
-
 @media (max-width: 600px) {
-    nav a { margin: 6px; }
-    main { padding: 0 10px; }
-    .card { padding: 14px; }
+    nav a {
+        display: inline-block;
+        margin: 6px;
+    }
 }
 </style>
 """
 
-STAFF_NAV = """
+NAV = """
 <header>
     <h1>Facility Maintenance System</h1>
-    <p>Digital Facility Damage Reporting &amp;
-       Maintenance Tracking</p>
+    <p>Digital Facility Damage Reporting &amp; Maintenance Tracking</p>
 </header>
+
 <nav>
     <a href="/">Report Damage</a>
-    <a href="/admin/login">Admin Login</a>
-</nav>
-"""
-
-ADMIN_NAV = """
-<header>
-    <h1>Facility Maintenance System</h1>
-    <p>Maintenance Management Portal</p>
-</header>
-<nav>
     <a href="/dashboard">Dashboard</a>
     <a href="/complaints">View Complaints</a>
-    <a href="/admin/logout">Logout</a>
+    <a href="/admin/logout">Log out</a>
 </nav>
 """
-
-
 # =====================================
-# 5. ADMIN LOGIN AND LOGOUT
+# 4. ADMIN LOGIN / LOGOUT
 # =====================================
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    if "admin_username" in session:
-        return redirect(url_for("dashboard"))
-
     error_message = None
 
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
+        password_hash = ADMIN_ACCOUNTS.get(username)
 
-        stored_hash = ADMIN_ACCOUNTS.get(username)
-
-        if (
-            isinstance(stored_hash, str)
-            and stored_hash
-            and check_password_hash(stored_hash, password)
+        if password_hash and check_password_hash(
+            password_hash, password
         ):
             session.clear()
             session["admin_username"] = username
@@ -387,59 +379,50 @@ def admin_login():
 
             return redirect(url_for("dashboard"))
 
-        error_message = "Invalid username or password."
+        error_message = "Username or password is incorrect."
 
     next_path = request.args.get("next", "")
 
-    html = """
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
         <title>Admin Login</title>
-    """ + STYLE + """
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        """ + STYLE + """
     </head>
     <body>
-    """ + STAFF_NAV + """
-    <main>
-        <div class="card login-card">
-            <h2>Maintenance Admin Login</h2>
-            <p class="muted">
-                Authorised maintenance managers only.
-            </p>
+        <header>
+            <h1>GES Maintenance Team</h1>
+            <p>Administrator Login</p>
+        </header>
+        <main>
+            <div class="card" style="max-width:500px;margin:auto;">
+                <h2>Admin Login</h2>
 
-            {% if error_message %}
-            <div class="message error">{{ error_message }}</div>
-            {% endif %}
+                {% if error_message %}
+                    <p style="color:#b42318;">{{ error_message }}</p>
+                {% endif %}
 
-            <form method="POST">
-                <input type="hidden" name="next" value="{{ next_path }}">
+                <form method="POST">
+                    <input type="hidden" name="next" value="{{ next_path }}">
 
-                <label>Username</label>
-                <input type="text" name="username"
-                       autocomplete="username" required>
+                    <label>Username</label>
+                    <input name="username" autocomplete="username" required>
 
-                <label>Password</label>
-                <input type="password" name="password"
-                       autocomplete="current-password" required>
+                    <label>Password</label>
+                    <input type="password" name="password"
+                           autocomplete="current-password" required>
 
-                <button type="submit">Login</button>
-            </form>
-        </div>
-    </main>
+                    <button type="submit">Log in</button>
+                </form>
+
+                <p><a href="/">Back to Report Damage</a></p>
+            </div>
+        </main>
     </body>
     </html>
-    """
-
-    response = app.make_response(render_template_string(
-        html,
-        error_message=error_message,
-        next_path=next_path
-    ))
-    response.headers["Cache-Control"] = "no-store"
-    return response
+    """, error_message=error_message, next_path=next_path)
 
 
 @app.route("/admin/logout")
@@ -449,13 +432,17 @@ def admin_logout():
 
 
 # =====================================
-# 6. STAFF DAMAGE REPORT FORM
+# 5. PUBLIC REPORT DAMAGE FORM
 # =====================================
 
 @app.route("/", methods=["GET", "POST"])
 def home():
     error_message = None
-    success_message = None
+    success_message = (
+        "Your complaint was submitted successfully."
+        if request.args.get("submitted") == "1"
+        else None
+    )
 
     if request.method == "POST":
         reporter = request.form.get("reporter", "").strip()
@@ -463,259 +450,208 @@ def home():
         damage = request.form.get("damage", "").strip()
         description = request.form.get("description", "").strip()
         priority = request.form.get("priority", "Medium")
+        photo = request.files.get("photo")
+        photo_filename = None
 
-        if not all([reporter, location, damage, description]):
+        if not reporter or not location or not damage or not description:
             error_message = "Please complete all required fields."
 
         elif priority not in ALLOWED_PRIORITIES:
-            error_message = "Invalid priority level."
+            error_message = "Invalid priority selected."
 
         else:
-            photo_path = None
-
             try:
-                photo_path = save_uploaded_photo(
-                    request.files.get("damage_photo")
-                )
-            except ValueError as exc:
-                error_message = str(exc)
+                if photo and photo.filename:
+                    photo_filename = save_uploaded_photo(photo)
 
-            if error_message is None:
-                conn = get_connection()
-                conn.execute("""
-                    INSERT INTO complaints (
+                reported_at = datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
+
+                with get_connection() as conn:
+                    conn.execute("""
+                        INSERT INTO complaints
+                        (reporter, location, damage, description,
+                         date_reported, status, technician, priority,
+                         photo_path)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
                         reporter, location, damage, description,
-                        date_reported, status, priority, photo_path
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    reporter,
-                    location,
-                    damage,
-                    description,
-                    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "Pending",
-                    priority,
-                    photo_path
-                ))
-                conn.commit()
-                conn.close()
+                        reported_at, "Pending", None, priority,
+                        photo_filename
+                    ))
 
-                success_message = (
-                    "Your complaint was submitted successfully."
+                return redirect(url_for("home", submitted="1"))
+
+            except (ValueError, psycopg.Error) as error:
+                if photo_filename:
+                    try:
+                        os.remove(
+                            os.path.join(UPLOAD_FOLDER, photo_filename)
+                        )
+                    except OSError:
+                        pass
+
+                app.logger.exception("Could not save complaint")
+                error_message = (
+                    str(error) if isinstance(error, ValueError)
+                    else "Unable to save the complaint. Please try again."
                 )
 
-    html = """
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
         <title>Report Damage</title>
-    """ + STYLE + """
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        """ + STYLE + """
     </head>
     <body>
-    """ + STAFF_NAV + """
-    <main>
-        <div class="card">
-            <h2>Report Facility Damage</h2>
-            <p class="muted">
-                Complete this form to report a facility problem.
+        <header>
+            <h1>Report Facility Damage</h1>
+            <p>GES Maintenance Team</p>
+        </header>
+
+        <main>
+            <div class="card">
+                <h2>Submit a Damage Report</h2>
+                <p>Complete this form to report a facility problem.</p>
+
+                {% if error_message %}
+                    <p style="color:#b42318;">{{ error_message }}</p>
+                {% endif %}
+
+                {% if success_message %}
+                    <p style="color:#067647;font-weight:bold;">
+                        {{ success_message }}
+                    </p>
+                {% endif %}
+
+                <form method="POST" enctype="multipart/form-data">
+                    <label>Reporter Name *</label>
+                    <input name="reporter" required>
+
+                    <label>Location *</label>
+                    <input name="location" required
+                           placeholder="Building, floor or room">
+
+                    <label>Type of Damage *</label>
+                    <input name="damage" required
+                           placeholder="e.g. Air conditioning, lighting">
+
+                    <label>Description *</label>
+                    <textarea name="description" rows="4" required></textarea>
+
+                    <label>Priority</label>
+                    <select name="priority">
+                        <option>Low</option>
+                        <option selected>Medium</option>
+                        <option>High</option>
+                    </select>
+
+                    <label>Photo (optional, maximum 5 MB)</label>
+                    <input type="file" name="photo"
+                           accept=".jpg,.jpeg,.png,.webp">
+
+                    <button type="submit">Submit Complaint</button>
+                </form>
+            </div>
+
+            <p style="text-align:center;">
+                <a href="/admin/login">Maintenance Team Login</a>
             </p>
-
-            {% if error_message %}
-            <div class="message error">{{ error_message }}</div>
-            {% endif %}
-
-            {% if success_message %}
-            <div class="message">{{ success_message }}</div>
-            {% endif %}
-
-            <form method="POST" enctype="multipart/form-data">
-                <label>Reporter Name</label>
-                <input type="text" name="reporter" required>
-
-                <label>Building / Location</label>
-                <input type="text" name="location"
-                       placeholder="Example: Building A, Level 2"
-                       required>
-
-                <label>Type of Damage</label>
-                <input type="text" name="damage"
-                       placeholder="Example: Lamp Damage" required>
-
-                <label>Description</label>
-                <textarea name="description" rows="4" required></textarea>
-
-                <label>Damage Photo (optional)</label>
-                <input type="file" name="damage_photo"
-                       accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp"
-                       capture="environment"
-                       onchange="previewDamagePhoto(event)">
-
-                <p class="muted">
-                    JPG, JPEG, PNG or WEBP; maximum 5 MB.
-                </p>
-
-                <img id="photoPreview" class="photo-preview"
-                     alt="Damage photo preview">
-
-                <label>Priority Level</label>
-                <select name="priority" required>
-                    <option value="Low">Low</option>
-                    <option value="Medium" selected>Medium</option>
-                    <option value="High">High</option>
-                </select>
-
-                <button type="submit">Submit Complaint</button>
-            </form>
-        </div>
-    </main>
-
-    <script>
-    function previewDamagePhoto(event) {
-        const file = event.target.files[0];
-        const preview = document.getElementById("photoPreview");
-
-        if (!file) {
-            preview.style.display = "none";
-            preview.removeAttribute("src");
-            return;
-        }
-
-        const allowedTypes = [
-            "image/jpeg", "image/png", "image/webp"
-        ];
-
-        if (!allowedTypes.includes(file.type)) {
-            alert("Please select a JPG, PNG or WEBP image.");
-            event.target.value = "";
-            preview.style.display = "none";
-            return;
-        }
-
-        if (file.size > 5 * 1024 * 1024) {
-            alert("Image must be 5 MB or smaller.");
-            event.target.value = "";
-            preview.style.display = "none";
-            return;
-        }
-
-        preview.src = URL.createObjectURL(file);
-        preview.style.display = "block";
-    }
-    </script>
+        </main>
     </body>
     </html>
-    """
-
-    return render_template_string(
-        html,
-        error_message=error_message,
-        success_message=success_message
-    )
+    """, error_message=error_message,
+         success_message=success_message)
 
 
 # =====================================
-# 7. DASHBOARD
+# 6. ADMIN DASHBOARD
 # =====================================
-
-def get_dashboard_counts():
-    conn = get_connection()
-    counts = {}
-
-    counts["total"] = conn.execute(
-        "SELECT COUNT(*) FROM complaints"
-    ).fetchone()[0]
-
-    for status in ALLOWED_STATUSES:
-        key = "status_" + status.lower().replace(" ", "_")
-        counts[key] = conn.execute(
-            "SELECT COUNT(*) FROM complaints WHERE status = ?",
-            (status,)
-        ).fetchone()[0]
-
-    for priority in ALLOWED_PRIORITIES:
-        counts["priority_" + priority.lower()] = conn.execute("""
-            SELECT COUNT(*)
-            FROM complaints
-            WHERE COALESCE(priority, 'Medium') = ?
-              AND status NOT IN ('Completed', 'Closed')
-        """, (priority,)).fetchone()[0]
-
-    conn.close()
-    return counts
-
 
 @app.route("/dashboard")
 @admin_required
 def dashboard():
     counts = get_dashboard_counts()
 
-    cards = [
-        ("Total Complaints", counts["total"],
-         "/complaints", "All records"),
-        ("Pending", counts["status_pending"],
-         "/complaints?status=Pending", "Awaiting action"),
-        ("In Progress", counts["status_in_progress"],
-         "/complaints?status=In%20Progress", "Work underway"),
-        ("Waiting Parts", counts["status_waiting_parts"],
-         "/complaints?status=Waiting%20Parts", "Parts required"),
-        ("Completed", counts["status_completed"],
-         "/complaints?status=Completed", "Work completed"),
-        ("Closed", counts["status_closed"],
-         "/complaints?status=Closed", "Cases closed"),
-        ("Open Low Priority", counts["priority_low"],
-         "/complaints?priority=Low&open=1", "Low priority, open"),
-        ("Open Medium Priority", counts["priority_medium"],
-         "/complaints?priority=Medium&open=1", "Medium priority, open"),
-        ("Open High Priority", counts["priority_high"],
-         "/complaints?priority=High&open=1", "High priority, open")
-    ]
-
-    html = """
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
         <title>Maintenance Dashboard</title>
-    """ + STYLE + """
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        """ + STYLE + """
     </head>
     <body>
-    """ + ADMIN_NAV + """
-    <main>
-        <h2>Maintenance Dashboard</h2>
-        <p class="muted">
-            Logged in as {{ username }}.
-            Click a card to view related records.
-        </p>
+        """ + NAV + """
+        <main>
+            <h1>Maintenance Dashboard</h1>
+            <p>
+                Logged in as {{ session.get("admin_username") }}.
+                Click a card to view related records.
+            </p>
 
-        <div class="dashboard">
-        {% for title, number, link, hint in cards %}
-            <a class="card stat" href="{{ link }}">
-                <h3>{{ title }}</h3>
-                <div class="number">{{ number }}</div>
-                <div class="hint">{{ hint }} &rarr;</div>
-            </a>
-        {% endfor %}
-        </div>
-    </main>
+            <div class="dashboard">
+                <a class="card stat" href="/complaints">
+                    <h3>Total Complaints</h3>
+                    <div class="number">{{ counts.total }}</div>
+                    <div class="hint">All records →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?status=Pending">
+                    <h3>Pending</h3>
+                    <div class="number">{{ counts.status_pending }}</div>
+                    <div class="hint">Awaiting action →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?status=In%20Progress">
+                    <h3>In Progress</h3>
+                    <div class="number">{{ counts.status_in_progress }}</div>
+                    <div class="hint">Work underway →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?status=Waiting%20Parts">
+                    <h3>Waiting Parts</h3>
+                    <div class="number">{{ counts.status_waiting_parts }}</div>
+                    <div class="hint">Parts required →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?status=Completed">
+                    <h3>Completed</h3>
+                    <div class="number">{{ counts.status_completed }}</div>
+                    <div class="hint">Work completed →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?status=Closed">
+                    <h3>Closed</h3>
+                    <div class="number">{{ counts.status_closed }}</div>
+                    <div class="hint">Cases closed →</div>
+                </a>
+
+                <a class="card stat" href="/complaints?priority=Low">
+                    <h3>Open Low Priority</h3>
+                    <div class="number">{{ counts.priority_low }}</div>
+                </a>
+
+                <a class="card stat" href="/complaints?priority=Medium">
+                    <h3>Open Medium Priority</h3>
+                    <div class="number">{{ counts.priority_medium }}</div>
+                </a>
+
+                <a class="card stat" href="/complaints?priority=High">
+                    <h3>Open High Priority</h3>
+                    <div class="number">{{ counts.priority_high }}</div>
+                </a>
+            </div>
+        </main>
     </body>
     </html>
-    """
-
-    return render_template_string(
-        html,
-        cards=cards,
-        username=session["admin_username"]
-    )
-
-
+    """, counts=counts)
+    
 # =====================================
-# 8. COMPLAINT LIST AND FILTERS
+# 7. COMPLAINT LIST AND FILTERS
 # =====================================
 
 @app.route("/complaints")
@@ -723,7 +659,6 @@ def dashboard():
 def complaints():
     status_filter = request.args.get("status", "")
     priority_filter = request.args.get("priority", "")
-    open_filter = request.args.get("open", "")
 
     if status_filter and status_filter not in ALLOWED_STATUSES:
         return "Invalid status filter.", 400
@@ -735,207 +670,183 @@ def complaints():
     params = []
 
     if status_filter:
-        query += " AND status = ?"
+        query += " AND status = %s"
         params.append(status_filter)
 
     if priority_filter:
-        query += " AND COALESCE(priority, 'Medium') = ?"
+        query += " AND COALESCE(priority, 'Medium') = %s"
         params.append(priority_filter)
-
-    if open_filter == "1":
-        query += " AND status NOT IN ('Completed', 'Closed')"
 
     query += " ORDER BY id DESC"
 
-    conn = get_connection()
-    records = conn.execute(query, params).fetchall()
-    conn.close()
+    with get_connection() as conn:
+        records = conn.execute(query, params).fetchall()
 
-    filter_title = "All Complaint Records"
-
-    if status_filter:
-        filter_title = "Status: " + status_filter
-    elif priority_filter:
-        filter_title = "Priority: " + priority_filter + " (Open)"
-
-    html = """
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
         <title>Complaint Records</title>
-    """ + STYLE + """
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        """ + STYLE + """
     </head>
     <body>
-    """ + ADMIN_NAV + """
-    <main>
-        <h2>{{ filter_title }}</h2>
-        <p>Logged in as {{ username }}.</p>
-        <p><a href="/complaints">Show all records</a></p>
+        """ + NAV + """
+        <main>
+            <h2>Complaint Records</h2>
+            <p>{{ records|length }} record(s) found.</p>
 
-        {% if records %}
-        <div class="table-wrap">
-        <table>
-            <tr>
-                <th>ID</th><th>Reporter</th><th>Location</th>
-                <th>Damage</th><th>Date</th><th>Photo</th>
-                <th>Priority</th><th>Technician</th>
-                <th>Status</th><th>Actions</th>
-            </tr>
+            <p><a href="/complaints">Show all records</a></p>
 
-            {% for row in records %}
-            <tr>
-                <td>{{ row['id'] }}</td>
-                <td>{{ row['reporter'] or '' }}</td>
-                <td>{{ row['location'] or '' }}</td>
-                <td>{{ row['damage'] or '' }}</td>
-                <td>{{ row['date_reported'] or '' }}</td>
-                <td>
-                    {% if row['photo_path'] %}
-                    <a href="{{ url_for('uploaded_photo',
-                              filename=row['photo_path']) }}"
-                       target="_blank" rel="noopener">View photo</a>
-                    {% else %}
-                    <span class="muted">No photo</span>
-                    {% endif %}
-                </td>
-                <td>{{ row['priority'] or 'Medium' }}</td>
-                <td>
-                    <form method="POST"
-                          action="/assign_technician/{{ row['id'] }}">
-                        <select name="technician" required>
-                            <option value="">Select technician</option>
-                            {% for tech in technicians %}
-                            <option value="{{ tech }}"
-                            {% if row['technician'] == tech %}selected{% endif %}>
-                                {{ tech }}
-                            </option>
-                            {% endfor %}
-                        </select>
-                        <button type="submit">Assign</button>
-                    </form>
-                </td>
-                <td>
-                    <form method="POST"
-                          action="/update_status/{{ row['id'] }}">
-                        <select name="status" required>
-                            {% for s in statuses %}
-                            <option value="{{ s }}"
-                            {% if row['status'] == s %}selected{% endif %}>
-                                {{ s }}
-                            </option>
-                            {% endfor %}
-                        </select>
-                        <button type="submit">Update</button>
-                    </form>
-                </td>
-                <td>
-                    <a class="button secondary"
-                       href="/complaint/{{ row['id'] }}">Details</a>
-                    <form method="POST"
-                          action="/delete_complaint/{{ row['id'] }}"
-                          onsubmit="return confirm(
-                          'Delete this complaint permanently?'
-                          );">
-                        <button class="danger" type="submit">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </table>
-        </div>
-        {% else %}
-        <div class="card">No complaints match this filter.</div>
-        {% endif %}
-    </main>
+            {% if records %}
+            <div class="table-wrap">
+            <table>
+                <tr>
+                    <th>ID</th>
+                    <th>Reporter</th>
+                    <th>Location</th>
+                    <th>Damage</th>
+                    <th>Date</th>
+                    <th>Priority</th>
+                    <th>Technician</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+
+                {% for row in records %}
+                <tr>
+                    <td>{{ row.id }}</td>
+                    <td>{{ row.reporter or "" }}</td>
+                    <td>{{ row.location or "" }}</td>
+                    <td>{{ row.damage or "" }}</td>
+                    <td>{{ row.date_reported or "" }}</td>
+                    <td>{{ row.priority or "Medium" }}</td>
+
+                    <td>
+                        <form method="POST"
+                              action="/assign_technician/{{ row.id }}">
+                            <select name="technician" required>
+                                <option value="">Select technician</option>
+                                {% for tech in technicians %}
+                                <option value="{{ tech }}"
+                                {% if row.technician == tech %}selected{% endif %}>
+                                    {{ tech }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <button type="submit">Assign</button>
+                        </form>
+                    </td>
+
+                    <td>
+                        <form method="POST"
+                              action="/update_status/{{ row.id }}">
+                            <select name="status" required>
+                                {% for s in statuses %}
+                                <option value="{{ s }}"
+                                {% if row.status == s %}selected{% endif %}>
+                                    {{ s }}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <button type="submit">Update</button>
+                        </form>
+                    </td>
+
+                    <td>
+                        <a class="button"
+                           href="/complaint/{{ row.id }}">Details</a>
+
+                        <form method="POST"
+                              action="/delete_complaint/{{ row.id }}"
+                              onsubmit="return confirm(
+                              'Delete this complaint permanently?'
+                              );">
+                            <button class="danger" type="submit">
+                                Delete
+                            </button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+            </div>
+            {% else %}
+            <div class="card">No complaints found.</div>
+            {% endif %}
+        </main>
     </body>
     </html>
-    """
-
-    return render_template_string(
-        html,
-        records=records,
-        technicians=TECHNICIANS,
-        statuses=ALLOWED_STATUSES,
-        filter_title=filter_title,
-        username=session["admin_username"]
-    )
+    """,
+    records=records,
+    technicians=TECHNICIANS,
+    statuses=ALLOWED_STATUSES)
 
 
 # =====================================
-# 9. COMPLAINT DETAILS
+# 8. COMPLAINT DETAILS
 # =====================================
 
 @app.route("/complaint/<int:complaint_id>")
 @admin_required
 def complaint_details(complaint_id):
-    conn = get_connection()
-    record = conn.execute(
-        "SELECT * FROM complaints WHERE id = ?",
-        (complaint_id,)
-    ).fetchone()
-    conn.close()
+    with get_connection() as conn:
+        record = conn.execute(
+            "SELECT * FROM complaints WHERE id = %s",
+            (complaint_id,)
+        ).fetchone()
 
     if record is None:
         return "Complaint not found.", 404
 
-    html = """
+    return render_template_string("""
     <!DOCTYPE html>
     <html>
     <head>
-        <meta charset="utf-8">
-        <meta name="viewport"
-              content="width=device-width, initial-scale=1">
         <title>Complaint Details</title>
-    """ + STYLE + """
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        """ + STYLE + """
     </head>
     <body>
-    """ + ADMIN_NAV + """
-    <main>
-        <div class="card">
-            <h2>Complaint #{{ row['id'] }}</h2>
-            <p><b>Reporter:</b> {{ row['reporter'] or '' }}</p>
-            <p><b>Location:</b> {{ row['location'] or '' }}</p>
-            <p><b>Damage:</b> {{ row['damage'] or '' }}</p>
-            <p><b>Description:</b></p>
-            <p>{{ row['description'] or '' }}</p>
-            <p><b>Date Reported:</b>
-                {{ row['date_reported'] or '' }}</p>
-            <p><b>Priority:</b>
-                {{ row['priority'] or 'Medium' }}</p>
-            <p><b>Technician:</b>
-                {{ row['technician'] or 'Not assigned' }}</p>
-            <p><b>Status:</b> {{ row['status'] or 'Pending' }}</p>
+        """ + NAV + """
+        <main>
+            <div class="card">
+                <h2>Complaint #{{ row.id }}</h2>
 
-            {% if row['photo_path'] %}
-            <p><b>Damage Photo:</b></p>
-            <a href="{{ url_for('uploaded_photo',
-                      filename=row['photo_path']) }}"
-               target="_blank" rel="noopener">
-                <img class="photo-detail"
-                     src="{{ url_for('uploaded_photo',
-                              filename=row['photo_path']) }}"
-                     alt="Reported damage">
-            </a>
-            {% else %}
-            <p><b>Damage Photo:</b> No photo uploaded.</p>
-            {% endif %}
+                <p><b>Reporter:</b> {{ row.reporter or "" }}</p>
+                <p><b>Location:</b> {{ row.location or "" }}</p>
+                <p><b>Damage:</b> {{ row.damage or "" }}</p>
+                <p><b>Description:</b></p>
+                <p>{{ row.description or "" }}</p>
+                <p><b>Date reported:</b> {{ row.date_reported or "" }}</p>
+                <p><b>Priority:</b> {{ row.priority or "Medium" }}</p>
+                <p><b>Technician:</b>
+                    {{ row.technician or "Not assigned" }}
+                </p>
+                <p><b>Status:</b> {{ row.status or "Pending" }}</p>
 
-            <p><a class="button" href="/complaints">
-                Back to complaints</a></p>
-        </div>
-    </main>
+                {% if row.photo_path %}
+                    <p><b>Damage Photo:</b></p>
+                    <img class="photo-detail"
+                         src="{{ url_for('uploaded_photo',
+                                          filename=row.photo_path) }}"
+                         alt="Reported damage">
+                {% else %}
+                    <p>No photo uploaded.</p>
+                {% endif %}
+
+                <p><a class="button" href="/complaints">
+                    Back to complaints
+                </a></p>
+            </div>
+        </main>
     </body>
     </html>
-    """
-
-    return render_template_string(html, row=record)
+    """, row=record)
 
 
 # =====================================
-# 10. SERVE PHOTOS TO AUTHENTICATED ADMINS
+# 9. SERVE UPLOADED PHOTOS
 # =====================================
 
 @app.route("/uploads/<path:filename>")
@@ -951,13 +862,11 @@ def uploaded_photo(filename):
 
 
 # =====================================
-# 11. ASSIGN TECHNICIAN
+# 10. ASSIGN TECHNICIAN
 # =====================================
 
-@app.route(
-    "/assign_technician/<int:complaint_id>",
-    methods=["POST"]
-)
+@app.route("/assign_technician/<int:complaint_id>",
+           methods=["POST"])
 @admin_required
 def assign_technician(complaint_id):
     technician = request.form.get("technician", "")
@@ -965,29 +874,26 @@ def assign_technician(complaint_id):
     if technician not in TECHNICIANS:
         return "Invalid technician.", 400
 
-    conn = get_connection()
-    cursor = conn.execute(
-        "UPDATE complaints SET technician = ? WHERE id = ?",
-        (technician, complaint_id)
-    )
-    conn.commit()
-    found = cursor.rowcount
-    conn.close()
+    with get_connection() as conn:
+        result = conn.execute(
+            "UPDATE complaints SET technician = %s WHERE id = %s",
+            (technician, complaint_id)
+        )
+
+        found = result.rowcount
 
     if not found:
         return "Complaint not found.", 404
 
-    return redirect(url_for("complaints"))
+    return redirect(request.referrer or url_for("complaints"))
 
 
 # =====================================
-# 12. UPDATE STATUS
+# 11. UPDATE STATUS
 # =====================================
 
-@app.route(
-    "/update_status/<int:complaint_id>",
-    methods=["POST"]
-)
+@app.route("/update_status/<int:complaint_id>",
+           methods=["POST"])
 @admin_required
 def update_status(complaint_id):
     status = request.form.get("status", "")
@@ -995,54 +901,49 @@ def update_status(complaint_id):
     if status not in ALLOWED_STATUSES:
         return "Invalid status.", 400
 
-    conn = get_connection()
-    cursor = conn.execute(
-        "UPDATE complaints SET status = ? WHERE id = ?",
-        (status, complaint_id)
-    )
-    conn.commit()
-    found = cursor.rowcount
-    conn.close()
+    with get_connection() as conn:
+        result = conn.execute(
+            "UPDATE complaints SET status = %s WHERE id = %s",
+            (status, complaint_id)
+        )
+
+        found = result.rowcount
 
     if not found:
         return "Complaint not found.", 404
 
-    return redirect(url_for("complaints"))
+    return redirect(request.referrer or url_for("complaints"))
 
 
 # =====================================
-# 13. DELETE COMPLAINT
+# 12. DELETE COMPLAINT
 # =====================================
 
-@app.route(
-    "/delete_complaint/<int:complaint_id>",
-    methods=["POST"]
-)
+@app.route("/delete_complaint/<int:complaint_id>",
+           methods=["POST"])
 @admin_required
 def delete_complaint(complaint_id):
-    conn = get_connection()
-    record = conn.execute(
-        "SELECT photo_path FROM complaints WHERE id = ?",
-        (complaint_id,)
-    ).fetchone()
+    with get_connection() as conn:
+        record = conn.execute(
+            "SELECT photo_path FROM complaints WHERE id = %s",
+            (complaint_id,)
+        ).fetchone()
 
-    if record is None:
-        conn.close()
-        return "Complaint not found.", 404
+        if record is None:
+            return "Complaint not found.", 404
 
-    photo_path = record["photo_path"]
+        photo_path = record["photo_path"]
 
-    conn.execute(
-        "DELETE FROM complaints WHERE id = ?",
-        (complaint_id,)
-    )
-    conn.commit()
-    conn.close()
+        conn.execute(
+            "DELETE FROM complaints WHERE id = %s",
+            (complaint_id,)
+        )
 
     if photo_path:
-        filename = os.path.basename(photo_path)
-        image_path = os.path.join(UPLOAD_FOLDER, filename)
-
+        image_path = os.path.join(
+            UPLOAD_FOLDER,
+            os.path.basename(photo_path)
+        )
         if os.path.isfile(image_path):
             os.remove(image_path)
 
@@ -1050,18 +951,10 @@ def delete_complaint(complaint_id):
 
 
 # =====================================
-# 14. ERROR HANDLERS
+# 13. START APPLICATION
 # =====================================
 
-@app.errorhandler(413)
-def file_too_large(error):
-    return "Image too large. Maximum upload size is 5 MB.", 413
-
-
-# =====================================
-# 15. INITIALIZE DATABASE
-# =====================================
-
+# Create the database table when Gunicorn imports this application.
 create_database()
 
 if __name__ == "__main__":
