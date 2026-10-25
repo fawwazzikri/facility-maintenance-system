@@ -1,49 +1,88 @@
 
 from flask import (
     Flask, render_template_string, request, redirect,
-    url_for, send_from_directory, abort
+    url_for, send_from_directory, abort, session, flash
 )
+from functools import wraps
+from werkzeug.security import check_password_hash
+from werkzeug.utils import secure_filename
+from datetime import datetime
 import sqlite3
 import os
 import uuid
-from datetime import datetime
-from werkzeug.utils import secure_filename
+import json
+import secrets
 
 app = Flask(__name__)
 
 # =====================================
-# 1. APPLICATION CONFIGURATION
+# 1. CONFIGURATION AND SECURITY
 # =====================================
+
+secret_key = os.environ.get("SECRET_KEY")
+
+if not secret_key:
+    if os.environ.get("RENDER"):
+        raise RuntimeError("SECRET_KEY is missing from Render.")
+    secret_key = secrets.token_hex(32)
+
+app.secret_key = secret_key
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+app.config["SESSION_COOKIE_SECURE"] = bool(
+    os.environ.get("RENDER")
+)
+app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
+
+try:
+    ADMIN_ACCOUNTS = json.loads(
+        os.environ.get("ADMIN_ACCOUNTS", "{}")
+    )
+except json.JSONDecodeError:
+    raise RuntimeError("ADMIN_ACCOUNTS must contain valid JSON.")
+
+if not isinstance(ADMIN_ACCOUNTS, dict):
+    raise RuntimeError("ADMIN_ACCOUNTS must be a JSON object.")
 
 DATABASE = os.path.join(app.root_path, "maintenance.db")
 UPLOAD_FOLDER = os.path.join(app.root_path, "uploads")
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 ALLOWED_STATUSES = [
-    "Pending",
-    "In Progress",
-    "Waiting Parts",
-    "Completed",
-    "Closed"
+    "Pending", "In Progress", "Waiting Parts",
+    "Completed", "Closed"
 ]
-
 ALLOWED_PRIORITIES = ["Low", "Medium", "High"]
-
-TECHNICIANS = [
-    "Technician A",
-    "Technician B",
-    "Technician C"
-]
-
+TECHNICIANS = ["Technician A", "Technician B", "Technician C"]
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 
 
 # =====================================
-# 2. DATABASE
+# 2. ACCESS CONTROL
+# =====================================
+
+def admin_required(view_function):
+    @wraps(view_function)
+    def wrapped_view(*args, **kwargs):
+        if "admin_username" not in session:
+            return redirect(url_for("admin_login", next=request.path))
+        return view_function(*args, **kwargs)
+    return wrapped_view
+
+
+def valid_internal_path(path):
+    return (
+        isinstance(path, str)
+        and path.startswith("/")
+        and not path.startswith("//")
+        and "\\" not in path
+    )
+
+
+# =====================================
+# 3. DATABASE
 # =====================================
 
 def get_connection():
@@ -67,12 +106,12 @@ def create_database():
         )
     """)
 
-    columns = [
+    columns = {
         row["name"]
         for row in conn.execute(
             "PRAGMA table_info(complaints)"
         ).fetchall()
-    ]
+    }
 
     if "technician" not in columns:
         conn.execute(
@@ -109,16 +148,12 @@ def save_uploaded_photo(photo):
     safe_name = secure_filename(photo.filename)
 
     if not safe_name or not allowed_file(safe_name):
-        raise ValueError(
-            "Use JPG, JPEG, PNG or WEBP images only."
-        )
+        raise ValueError("Use JPG, JPEG, PNG or WEBP images only.")
 
     data = photo.stream.read(5 * 1024 * 1024 + 1)
 
     if len(data) > 5 * 1024 * 1024:
-        raise ValueError(
-            "Image must be 5 MB or smaller."
-        )
+        raise ValueError("Image must be 5 MB or smaller.")
 
     extension = safe_name.rsplit(".", 1)[1].lower()
     filename = f"{uuid.uuid4().hex}.{extension}"
@@ -131,7 +166,7 @@ def save_uploaded_photo(photo):
 
 
 # =====================================
-# 3. WEBSITE DESIGN
+# 4. COMMON WEBSITE DESIGN
 # =====================================
 
 STYLE = """
@@ -154,16 +189,16 @@ header {
 
 nav {
     background: #244a73;
-    padding: 15px;
+    padding: 12px;
     text-align: center;
 }
 
 nav a {
     color: white;
     text-decoration: none;
-    margin: 6px 12px;
-    font-weight: bold;
+    margin: 6px 10px;
     display: inline-block;
+    font-weight: bold;
 }
 
 main {
@@ -182,9 +217,7 @@ main {
 
 .dashboard {
     display: grid;
-    grid-template-columns: repeat(
-        auto-fit, minmax(185px, 1fr)
-    );
+    grid-template-columns: repeat(auto-fit, minmax(185px, 1fr));
     gap: 16px;
     margin: 20px 0;
 }
@@ -193,13 +226,9 @@ main {
     display: block;
     color: #263244;
     text-decoration: none;
-    transition: transform .15s;
 }
 
-.stat:hover {
-    transform: translateY(-3px);
-}
-
+.stat:hover { transform: translateY(-2px); }
 .stat h3 { font-size: 16px; }
 
 .number {
@@ -239,12 +268,8 @@ button, .button {
     text-decoration: none;
 }
 
-button:hover, .button:hover {
-    background: #12558a;
-}
-
+button:hover, .button:hover { background: #12558a; }
 .danger { background: #b42318; }
-.danger:hover { background: #8f1d14; }
 .secondary { background: #52657a; }
 
 .table-wrap { overflow-x: auto; }
@@ -281,11 +306,21 @@ td form { min-width: 130px; }
     object-fit: contain;
 }
 
+.message {
+    padding: 12px;
+    margin-bottom: 12px;
+    border-radius: 6px;
+    background: #e8f2ff;
+}
+
 .error {
     background: #fff0f0;
     color: #b42318;
-    padding: 12px;
-    border-radius: 6px;
+}
+
+.login-card {
+    max-width: 460px;
+    margin: 35px auto;
 }
 
 @media (max-width: 600px) {
@@ -296,7 +331,7 @@ td form { min-width: 130px; }
 </style>
 """
 
-NAV = """
+STAFF_NAV = """
 <header>
     <h1>Facility Maintenance System</h1>
     <p>Digital Facility Damage Reporting &amp;
@@ -304,19 +339,123 @@ NAV = """
 </header>
 <nav>
     <a href="/">Report Damage</a>
+    <a href="/admin/login">Admin Login</a>
+</nav>
+"""
+
+ADMIN_NAV = """
+<header>
+    <h1>Facility Maintenance System</h1>
+    <p>Maintenance Management Portal</p>
+</header>
+<nav>
     <a href="/dashboard">Dashboard</a>
     <a href="/complaints">View Complaints</a>
+    <a href="/admin/logout">Logout</a>
 </nav>
 """
 
 
 # =====================================
-# 4. REPORT DAMAGE
+# 5. ADMIN LOGIN AND LOGOUT
+# =====================================
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    if "admin_username" in session:
+        return redirect(url_for("dashboard"))
+
+    error_message = None
+
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
+        stored_hash = ADMIN_ACCOUNTS.get(username)
+
+        if (
+            isinstance(stored_hash, str)
+            and stored_hash
+            and check_password_hash(stored_hash, password)
+        ):
+            session.clear()
+            session["admin_username"] = username
+
+            next_path = request.form.get("next", "")
+            if valid_internal_path(next_path):
+                return redirect(next_path)
+
+            return redirect(url_for("dashboard"))
+
+        error_message = "Invalid username or password."
+
+    next_path = request.args.get("next", "")
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport"
+              content="width=device-width, initial-scale=1">
+        <title>Admin Login</title>
+    """ + STYLE + """
+    </head>
+    <body>
+    """ + STAFF_NAV + """
+    <main>
+        <div class="card login-card">
+            <h2>Maintenance Admin Login</h2>
+            <p class="muted">
+                Authorised maintenance managers only.
+            </p>
+
+            {% if error_message %}
+            <div class="message error">{{ error_message }}</div>
+            {% endif %}
+
+            <form method="POST">
+                <input type="hidden" name="next" value="{{ next_path }}">
+
+                <label>Username</label>
+                <input type="text" name="username"
+                       autocomplete="username" required>
+
+                <label>Password</label>
+                <input type="password" name="password"
+                       autocomplete="current-password" required>
+
+                <button type="submit">Login</button>
+            </form>
+        </div>
+    </main>
+    </body>
+    </html>
+    """
+
+    response = app.make_response(render_template_string(
+        html,
+        error_message=error_message,
+        next_path=next_path
+    ))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
+# =====================================
+# 6. STAFF DAMAGE REPORT FORM
 # =====================================
 
 @app.route("/", methods=["GET", "POST"])
 def home():
     error_message = None
+    success_message = None
 
     if request.method == "POST":
         reporter = request.form.get("reporter", "").strip()
@@ -343,7 +482,6 @@ def home():
 
             if error_message is None:
                 conn = get_connection()
-
                 conn.execute("""
                     INSERT INTO complaints (
                         reporter, location, damage, description,
@@ -360,11 +498,12 @@ def home():
                     priority,
                     photo_path
                 ))
-
                 conn.commit()
                 conn.close()
 
-                return redirect(url_for("complaints"))
+                success_message = (
+                    "Your complaint was submitted successfully."
+                )
 
     html = """
     <!DOCTYPE html>
@@ -377,16 +516,20 @@ def home():
     """ + STYLE + """
     </head>
     <body>
-    """ + NAV + """
+    """ + STAFF_NAV + """
     <main>
         <div class="card">
             <h2>Report Facility Damage</h2>
             <p class="muted">
-                Complete the form to report a facility problem.
+                Complete this form to report a facility problem.
             </p>
 
             {% if error_message %}
-            <div class="error">{{ error_message }}</div>
+            <div class="message error">{{ error_message }}</div>
+            {% endif %}
+
+            {% if success_message %}
+            <div class="message">{{ success_message }}</div>
             {% endif %}
 
             <form method="POST" enctype="multipart/form-data">
@@ -403,8 +546,7 @@ def home():
                        placeholder="Example: Lamp Damage" required>
 
                 <label>Description</label>
-                <textarea name="description"
-                          rows="4" required></textarea>
+                <textarea name="description" rows="4" required></textarea>
 
                 <label>Damage Photo (optional)</label>
                 <input type="file" name="damage_photo"
@@ -469,12 +611,14 @@ def home():
     """
 
     return render_template_string(
-        html, error_message=error_message
+        html,
+        error_message=error_message,
+        success_message=success_message
     )
 
 
 # =====================================
-# 5. DASHBOARD
+# 7. DASHBOARD
 # =====================================
 
 def get_dashboard_counts():
@@ -487,7 +631,6 @@ def get_dashboard_counts():
 
     for status in ALLOWED_STATUSES:
         key = "status_" + status.lower().replace(" ", "_")
-
         counts[key] = conn.execute(
             "SELECT COUNT(*) FROM complaints WHERE status = ?",
             (status,)
@@ -506,6 +649,7 @@ def get_dashboard_counts():
 
 
 @app.route("/dashboard")
+@admin_required
 def dashboard():
     counts = get_dashboard_counts()
 
@@ -541,11 +685,12 @@ def dashboard():
     """ + STYLE + """
     </head>
     <body>
-    """ + NAV + """
+    """ + ADMIN_NAV + """
     <main>
         <h2>Maintenance Dashboard</h2>
         <p class="muted">
-            Click a card to view related complaint records.
+            Logged in as {{ username }}.
+            Click a card to view related records.
         </p>
 
         <div class="dashboard">
@@ -557,30 +702,24 @@ def dashboard():
             </a>
         {% endfor %}
         </div>
-
-        <div class="card">
-            <h3>Dashboard Information</h3>
-            <p>
-                Open priority counts exclude Completed and Closed
-                complaints.
-            </p>
-            <a class="button" href="/complaints">
-                Manage Complaints
-            </a>
-        </div>
     </main>
     </body>
     </html>
     """
 
-    return render_template_string(html, cards=cards)
+    return render_template_string(
+        html,
+        cards=cards,
+        username=session["admin_username"]
+    )
 
 
 # =====================================
-# 6. COMPLAINT LIST AND FILTERS
+# 8. COMPLAINT LIST AND FILTERS
 # =====================================
 
 @app.route("/complaints")
+@admin_required
 def complaints():
     status_filter = request.args.get("status", "")
     priority_filter = request.args.get("priority", "")
@@ -630,26 +769,20 @@ def complaints():
     """ + STYLE + """
     </head>
     <body>
-    """ + NAV + """
+    """ + ADMIN_NAV + """
     <main>
         <h2>{{ filter_title }}</h2>
-        <p>{{ records|length }} record(s) found.</p>
+        <p>Logged in as {{ username }}.</p>
         <p><a href="/complaints">Show all records</a></p>
 
         {% if records %}
         <div class="table-wrap">
         <table>
             <tr>
-                <th>ID</th>
-                <th>Reporter</th>
-                <th>Location</th>
-                <th>Damage</th>
-                <th>Date</th>
-                <th>Photo</th>
-                <th>Priority</th>
-                <th>Technician</th>
-                <th>Status</th>
-                <th>Actions</th>
+                <th>ID</th><th>Reporter</th><th>Location</th>
+                <th>Damage</th><th>Date</th><th>Photo</th>
+                <th>Priority</th><th>Technician</th>
+                <th>Status</th><th>Actions</th>
             </tr>
 
             {% for row in records %}
@@ -706,9 +839,7 @@ def complaints():
                           onsubmit="return confirm(
                           'Delete this complaint permanently?'
                           );">
-                        <button class="danger" type="submit">
-                            Delete
-                        </button>
+                        <button class="danger" type="submit">Delete</button>
                     </form>
                 </td>
             </tr>
@@ -728,23 +859,23 @@ def complaints():
         records=records,
         technicians=TECHNICIANS,
         statuses=ALLOWED_STATUSES,
-        filter_title=filter_title
+        filter_title=filter_title,
+        username=session["admin_username"]
     )
 
 
 # =====================================
-# 7. COMPLAINT DETAILS
+# 9. COMPLAINT DETAILS
 # =====================================
 
 @app.route("/complaint/<int:complaint_id>")
+@admin_required
 def complaint_details(complaint_id):
     conn = get_connection()
-
     record = conn.execute(
         "SELECT * FROM complaints WHERE id = ?",
         (complaint_id,)
     ).fetchone()
-
     conn.close()
 
     if record is None:
@@ -761,7 +892,7 @@ def complaint_details(complaint_id):
     """ + STYLE + """
     </head>
     <body>
-    """ + NAV + """
+    """ + ADMIN_NAV + """
     <main>
         <div class="card">
             <h2>Complaint #{{ row['id'] }}</h2>
@@ -771,14 +902,11 @@ def complaint_details(complaint_id):
             <p><b>Description:</b></p>
             <p>{{ row['description'] or '' }}</p>
             <p><b>Date Reported:</b>
-                {{ row['date_reported'] or '' }}
-            </p>
+                {{ row['date_reported'] or '' }}</p>
             <p><b>Priority:</b>
-                {{ row['priority'] or 'Medium' }}
-            </p>
+                {{ row['priority'] or 'Medium' }}</p>
             <p><b>Technician:</b>
-                {{ row['technician'] or 'Not assigned' }}
-            </p>
+                {{ row['technician'] or 'Not assigned' }}</p>
             <p><b>Status:</b> {{ row['status'] or 'Pending' }}</p>
 
             {% if row['photo_path'] %}
@@ -795,11 +923,8 @@ def complaint_details(complaint_id):
             <p><b>Damage Photo:</b> No photo uploaded.</p>
             {% endif %}
 
-            <p>
-                <a class="button" href="/complaints">
-                    Back to complaints
-                </a>
-            </p>
+            <p><a class="button" href="/complaints">
+                Back to complaints</a></p>
         </div>
     </main>
     </body>
@@ -810,10 +935,11 @@ def complaint_details(complaint_id):
 
 
 # =====================================
-# 8. SERVE UPLOADED PHOTOS
+# 10. SERVE PHOTOS TO AUTHENTICATED ADMINS
 # =====================================
 
 @app.route("/uploads/<path:filename>")
+@admin_required
 def uploaded_photo(filename):
     if os.path.basename(filename) != filename:
         abort(404)
@@ -825,13 +951,14 @@ def uploaded_photo(filename):
 
 
 # =====================================
-# 9. ASSIGN TECHNICIAN
+# 11. ASSIGN TECHNICIAN
 # =====================================
 
 @app.route(
     "/assign_technician/<int:complaint_id>",
     methods=["POST"]
 )
+@admin_required
 def assign_technician(complaint_id):
     technician = request.form.get("technician", "")
 
@@ -839,12 +966,10 @@ def assign_technician(complaint_id):
         return "Invalid technician.", 400
 
     conn = get_connection()
-
     cursor = conn.execute(
         "UPDATE complaints SET technician = ? WHERE id = ?",
         (technician, complaint_id)
     )
-
     conn.commit()
     found = cursor.rowcount
     conn.close()
@@ -852,17 +977,18 @@ def assign_technician(complaint_id):
     if not found:
         return "Complaint not found.", 404
 
-    return redirect(request.referrer or url_for("complaints"))
+    return redirect(url_for("complaints"))
 
 
 # =====================================
-# 10. UPDATE STATUS
+# 12. UPDATE STATUS
 # =====================================
 
 @app.route(
     "/update_status/<int:complaint_id>",
     methods=["POST"]
 )
+@admin_required
 def update_status(complaint_id):
     status = request.form.get("status", "")
 
@@ -870,12 +996,10 @@ def update_status(complaint_id):
         return "Invalid status.", 400
 
     conn = get_connection()
-
     cursor = conn.execute(
         "UPDATE complaints SET status = ? WHERE id = ?",
         (status, complaint_id)
     )
-
     conn.commit()
     found = cursor.rowcount
     conn.close()
@@ -883,20 +1007,20 @@ def update_status(complaint_id):
     if not found:
         return "Complaint not found.", 404
 
-    return redirect(request.referrer or url_for("complaints"))
+    return redirect(url_for("complaints"))
 
 
 # =====================================
-# 11. DELETE COMPLAINT
+# 13. DELETE COMPLAINT
 # =====================================
 
 @app.route(
     "/delete_complaint/<int:complaint_id>",
     methods=["POST"]
 )
+@admin_required
 def delete_complaint(complaint_id):
     conn = get_connection()
-
     record = conn.execute(
         "SELECT photo_path FROM complaints WHERE id = ?",
         (complaint_id,)
@@ -912,7 +1036,6 @@ def delete_complaint(complaint_id):
         "DELETE FROM complaints WHERE id = ?",
         (complaint_id,)
     )
-
     conn.commit()
     conn.close()
 
@@ -923,14 +1046,22 @@ def delete_complaint(complaint_id):
         if os.path.isfile(image_path):
             os.remove(image_path)
 
-    return redirect(request.referrer or url_for("complaints"))
+    return redirect(url_for("complaints"))
 
 
 # =====================================
-# 12. INITIALIZE DATABASE AND START
+# 14. ERROR HANDLERS
 # =====================================
 
-# Runs when Gunicorn imports this module on Render.
+@app.errorhandler(413)
+def file_too_large(error):
+    return "Image too large. Maximum upload size is 5 MB.", 413
+
+
+# =====================================
+# 15. INITIALIZE DATABASE
+# =====================================
+
 create_database()
 
 if __name__ == "__main__":
